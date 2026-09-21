@@ -1,0 +1,119 @@
+name: Update clean source
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: 'First deployment only: allow published source.json to return 404'
+        type: boolean
+        default: false
+      allow_large_drop:
+        description: 'After inspecting upstream: permit an app-count drop over 20%'
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'tests/**'
+      - 'requirements.txt'
+      - '.github/workflows/update.yml'
+permissions:
+  contents: read
+concurrency:
+  group: cypwn-pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publish' }}
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+  build:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      changed: ${{ steps.clean.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - uses: actions/configure-pages@v6.0.0
+        id: pages
+      - name: Fetch, clean, validate, and compare with published source
+        id: clean
+        env:
+          SOURCE_URL: ${{ steps.pages.outputs.base_url }}/source.json
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          ALLOW_LARGE_DROP: ${{ inputs.allow_large_drop }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          options=()
+          if [[ "$BOOTSTRAP" == "true" ]]; then options+=(--bootstrap); fi
+          if [[ "$ALLOW_LARGE_DROP" == "true" ]]; then options+=(--allow-large-drop); fi
+          python scripts/update_source.py --source-url "$SOURCE_URL" \
+            --previous-url "$SOURCE_URL" "${options[@]}"
+      - name: Upload only JSON metadata
+        if: steps.clean.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: docs
+      - name: Report unchanged source
+        if: steps.clean.outputs.changed != 'true'
+        run: echo 'Source unchanged. No deployment required.' >> "$GITHUB_STEP_SUMMARY"
+  deploy:
+    if: needs.build.outputs.changed == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish validated source
+        id: deployment
+        uses: actions/deploy-pages@v5.0.1
+      - name: Verify public endpoint
+        env:
+          SOURCE_URL: ${{ steps.deployment.outputs.page_url }}source.json
+        run: |
+          python - <<'PY'
+          import json, os, time, urllib.request
+          url = os.environ['SOURCE_URL']
+          for attempt in range(6):
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      assert response.status == 200
+                      assert response.headers.get_content_type() == 'application/json', 'Expected application/json'
+                      data = json.load(response)
+                      assert data['name'] == 'CyPwn Clean'
+                      ids = [a['bundleIdentifier'] for a in data['apps']]
+                      assert ids and len(ids) == len(set(ids))
+                  break
+              except Exception:
+                  if attempt == 5:
+                      raise
+                  time.sleep(10)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Deployed and verified public JSON endpoint: {url}\n')
+          PY
